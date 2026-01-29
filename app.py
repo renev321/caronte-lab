@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -31,6 +32,64 @@ DERIVED_FEATURE_COLS = [
     "rangeAtr",
     "bodyAtr",
 ]
+
+
+# ==========================================================
+# Candle loader (NinjaTrader "Last" TXT export)
+# Example line:
+# 20251103 000200;26031.25;26049;26029.25;26047.75;1637
+# (date) (time);O;H;L;C;V
+# ==========================================================
+def load_candles_last_txt(file_path: str) -> pd.DataFrame:
+    rows = []
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            # Some exports might use comma as decimal in other locales; we normalize later.
+            try:
+                left, o, h, l, c, v = line.split(";")
+                d, t = left.split()
+                ts = pd.to_datetime(d + t, format="%Y%m%d%H%M%S", errors="raise")
+                rows.append(
+                    (
+                        ts,
+                        float(o.replace(",", ".")),
+                        float(h.replace(",", ".")),
+                        float(l.replace(",", ".")),
+                        float(c.replace(",", ".")),
+                        float(v.replace(",", ".")),
+                    )
+                )
+            except Exception:
+                # ignore malformed lines
+                continue
+
+    df = pd.DataFrame(rows, columns=["ts", "o", "h", "l", "c", "v"])
+    if df.empty:
+        return df
+    df = df.sort_values("ts").drop_duplicates("ts", keep="last").reset_index(drop=True)
+    return df
+
+
+def _nearest_merge_signals_to_candles(signals: pd.DataFrame, candles: pd.DataFrame, tol_seconds: int = 60) -> pd.DataFrame:
+    """Merge on timestamp; if exact match missing, use nearest within tolerance."""
+    if signals.empty or candles.empty:
+        return signals
+
+    s = signals.copy().sort_values("ts")
+    c = candles.copy().sort_values("ts")
+
+    merged = pd.merge_asof(
+        s,
+        c,
+        on="ts",
+        direction="nearest",
+        tolerance=pd.Timedelta(seconds=tol_seconds),
+        suffixes=("", "_px"),
+    )
+    return merged
 
 
 def _safe_json_loads(line: str):
@@ -191,12 +250,152 @@ def compute_pseudo_outcomes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def compute_true_outcomes_from_candles(
+    df: pd.DataFrame,
+    candles: pd.DataFrame,
+    horizon_bars: int = 30,
+    match_tolerance_sec: int = 60,
+    good_mfe_atr: float = 1.0,
+    bad_mae_atr: float = 1.0,
+) -> pd.DataFrame:
+    """Compute forward MFE/MAE outcomes using candle series.
+
+    - Matches df.ts to nearest candle ts within tolerance.
+    - Uses entry = candle close on the signal bar.
+    - Direction from df.dir (UP/DOWN).
+    - Normalizes by df.atr if present/positive, else uses candle-based ATR(14).
+
+    Adds:
+      hasCandleMatch, candleIdx, mfeAtr, maeAtr, endAtr, goodSignal
+    """
+    if df.empty or candles is None or candles.empty:
+        out = df.copy()
+        for col in ["hasCandleMatch", "candleIdx", "mfeAtr", "maeAtr", "endAtr", "goodSignal"]:
+            if col not in out.columns:
+                out[col] = np.nan
+        return out
+
+    out = df.copy()
+    if "ts" not in out.columns:
+        out["hasCandleMatch"] = False
+        return out
+
+    # Ensure candle columns
+    for req in ["ts", "h", "l", "c"]:
+        if req not in candles.columns:
+            out["hasCandleMatch"] = False
+            return out
+
+    candles = candles.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    c_ts = candles["ts"].values.astype("datetime64[ns]")
+    s_ts = pd.to_datetime(out["ts"], errors="coerce").values.astype("datetime64[ns]")
+
+    # Nearest index via searchsorted
+    pos = np.searchsorted(c_ts, s_ts)
+    pos = np.clip(pos, 0, len(c_ts) - 1)
+    # choose closer of pos and pos-1
+    pos_prev = np.clip(pos - 1, 0, len(c_ts) - 1)
+    ts_pos = c_ts[pos]
+    ts_prev = c_ts[pos_prev]
+    diff_pos = np.abs((ts_pos - s_ts).astype("timedelta64[s]").astype(int))
+    diff_prev = np.abs((s_ts - ts_prev).astype("timedelta64[s]").astype(int))
+    use_prev = diff_prev <= diff_pos
+    idx = np.where(use_prev, pos_prev, pos)
+
+    nearest = c_ts[idx]
+    diff = np.abs((nearest - s_ts).astype("timedelta64[s]").astype(int))
+    out["candleIdx"] = idx
+    out["hasCandleMatch"] = diff <= int(match_tolerance_sec)
+
+    # Candle-based ATR(14) fallback
+    if "atr" not in out.columns:
+        out["atr"] = np.nan
+    if out["atr"].isna().any() or (out["atr"] <= 0).any():
+        prev_c = candles["c"].shift(1)
+        tr = pd.concat(
+            [
+                (candles["h"] - candles["l"]).abs(),
+                (candles["h"] - prev_c).abs(),
+                (candles["l"] - prev_c).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr14 = tr.rolling(14, min_periods=14).mean()
+    else:
+        atr14 = None
+
+    h = candles["h"].to_numpy(dtype=float)
+    l = candles["l"].to_numpy(dtype=float)
+    c = candles["c"].to_numpy(dtype=float)
+    atr_fallback = atr14.to_numpy(dtype=float) if atr14 is not None else None
+
+    mfe = np.full(len(out), np.nan)
+    mae = np.full(len(out), np.nan)
+    endr = np.full(len(out), np.nan)
+
+    dir_sign = out.get("dir", pd.Series(index=out.index, dtype=object)).map({"UP": 1, "DOWN": -1})
+    dir_sign = dir_sign.fillna(0).to_numpy(dtype=int)
+
+    for k in range(len(out)):
+        if not bool(out.loc[out.index[k], "hasCandleMatch"]):
+            continue
+        d = int(dir_sign[k])
+        if d == 0:
+            continue
+        i = int(idx[k])
+        j_end = min(len(c) - 1, i + int(max(1, horizon_bars)))
+        if j_end <= i:
+            continue
+
+        atrv = float(out.loc[out.index[k], "atr"]) if "atr" in out.columns else np.nan
+        if not np.isfinite(atrv) or atrv <= 0:
+            atrv = float(atr_fallback[i]) if atr_fallback is not None and np.isfinite(atr_fallback[i]) else np.nan
+        if not np.isfinite(atrv) or atrv <= 0:
+            continue
+
+        entry = float(c[i])
+        fut_h = h[i + 1 : j_end + 1]
+        fut_l = l[i + 1 : j_end + 1]
+        if fut_h.size == 0:
+            continue
+
+        if d == 1:
+            mfe_pts = max(0.0, float(np.max(fut_h - entry)))
+            mae_pts = max(0.0, float(np.max(entry - fut_l)))
+            end_pts = float(c[j_end] - entry)
+        else:
+            mfe_pts = max(0.0, float(np.max(entry - fut_l)))
+            mae_pts = max(0.0, float(np.max(fut_h - entry)))
+            end_pts = float(entry - c[j_end])
+
+        mfe[k] = mfe_pts / atrv
+        mae[k] = mae_pts / atrv
+        endr[k] = end_pts / atrv
+
+    out["mfeAtr"] = mfe
+    out["maeAtr"] = mae
+    out["endAtr"] = endr
+    out["goodSignal"] = (out["mfeAtr"] >= float(good_mfe_atr)) & (out["maeAtr"] <= float(bad_mae_atr))
+    return out
+
+
 def kpi_row(df_sig: pd.DataFrame):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Signals", f"{len(df_sig):,}")
-    c2.metric("Pseudo win rate", f"{(df_sig['pseudoWin'].mean()*100):.1f}%" if len(df_sig) else "—")
-    c3.metric("Median Δ to opp (ATR)", f"{df_sig['deltaToOppAtr'].median():.2f}" if len(df_sig) else "—")
-    c4.metric("Median bars to opp", f"{df_sig['barsToOpp'].median():.0f}" if len(df_sig) else "—")
+    if len(df_sig) == 0:
+        c2.metric("Win rate", "—")
+        c3.metric("Median outcome", "—")
+        c4.metric("Median risk", "—")
+        return
+
+    if "goodSignal" in df_sig.columns:
+        c2.metric("Win rate (true)", f"{(df_sig['goodSignal'].mean()*100):.1f}%")
+        c3.metric("Median MFE (ATR)", f"{df_sig['mfeAtr'].median():.2f}")
+        c4.metric("Median MAE (ATR)", f"{df_sig['maeAtr'].median():.2f}")
+    else:
+        c2.metric("Pseudo win rate", f"{(df_sig['pseudoWin'].mean()*100):.1f}%")
+        c3.metric("Median Δ to opp (ATR)", f"{df_sig['deltaToOppAtr'].median():.2f}")
+        c4.metric("Median bars to opp", f"{df_sig['barsToOpp'].median():.0f}")
 
 
 def main():
@@ -209,6 +408,19 @@ def main():
     folder_files = sorted([str(p) for p in Path(data_dir).glob("*.jsonl")]) if data_dir else []
 
     uploaded = st.sidebar.file_uploader("Upload .jsonl (optional)", type=["jsonl"], accept_multiple_files=True)
+
+    st.sidebar.header("Candles (optional)")
+    candles_up = st.sidebar.file_uploader(
+        "Upload NinjaTrader Last export (.txt)",
+        type=["txt"],
+        accept_multiple_files=False,
+        help="If provided, the app computes real forward MFE/MAE outcomes instead of proxy outcomes.",
+    )
+    with st.sidebar.expander("Outcome settings", expanded=False):
+        horizon_bars = st.slider("Forward horizon (bars)", 5, 300, 30, 5)
+        match_tol = st.slider("Timestamp match tolerance (sec)", 0, 180, 60, 10)
+        good_mfe = st.slider("Good signal threshold (MFE in ATR)", 0.25, 5.0, 1.0, 0.25)
+        bad_mae = st.slider("Max allowed MAE (ATR)", 0.25, 5.0, 1.0, 0.25)
 
     file_paths = []
     temp_dir = None
@@ -228,6 +440,25 @@ def main():
         st.stop()
 
     df, meta = load_jsonl_files(file_paths)
+
+    # ----------------------------------
+    # Optional candles (for true outcomes)
+    # ----------------------------------
+    candles: Optional[pd.DataFrame] = None
+    if candles_up is not None:
+        try:
+            ck = f"__candles__{candles_up.name}__{candles_up.size}"
+            if ck in st.session_state:
+                candles = st.session_state[ck]
+            else:
+                # Save to temp so the existing loader can read it
+                ctmp = Path(st.session_state.get("_tmp_dir", ".")) / f"_candles_{candles_up.name}"
+                ctmp.write_bytes(candles_up.getvalue())
+                candles = load_candles_last_txt(str(ctmp))
+                st.session_state[ck] = candles
+        except Exception as ex:
+            st.sidebar.warning(f"Could not parse candle file: {ex}")
+            candles = None
 
     # Header KPIs
     a, b, c, d = st.columns(4)
@@ -285,8 +516,19 @@ def main():
     else:
         f2_view = f2.copy()
 
+    # If we have candles, compute real forward outcomes
+    if candles is not None and not f2_view.empty:
+        f2_view = compute_true_outcomes_from_candles(
+            f2_view,
+            candles,
+            horizon_bars=horizon_bars,
+            match_tolerance_sec=match_tolerance_sec,
+            good_mfe_atr=good_mfe_atr,
+            bad_mae_atr=bad_mae_atr,
+        )
+
     # KPIs for signals
-    st.subheader("Signal quality (proxy)")
+    st.subheader("Signal quality" + (" (true outcomes)" if candles is not None else " (proxy)"))
     kpi_row(f2_view)
 
     # Events per day chart
@@ -311,29 +553,51 @@ def main():
 
     with left:
         feat = st.selectbox("Feature", options=[c for c in FEATURE_COLS + DERIVED_FEATURE_COLS if c in f2_view.columns], index=0)
-        yopt = st.selectbox("Outcome", options=["deltaToOppAtr", "barsToOpp", "barsToDeadzone"], index=0)
+        outcome_opts = ["deltaToOppAtr", "barsToOpp", "barsToDeadzone"]
+        if candles is not None:
+            outcome_opts += ["mfeAtr", "maeAtr", "endAtr", "goodSignal"]
+        yopt = st.selectbox("Outcome", options=outcome_opts, index=0)
 
         base = f2_view[[feat, yopt, "event", "dir", "instrument", "tf"]].dropna()
         if base.empty:
             st.info("Not enough data after filtering.")
         else:
-            scatter = (
-                alt.Chart(base)
-                .mark_circle(size=45, opacity=0.35)
-                .encode(
-                    x=alt.X(f"{feat}:Q", title=feat),
-                    y=alt.Y(f"{yopt}:Q", title=yopt),
-                    color=alt.Color("event:N", legend=None),
-                    tooltip=["instrument", "tf", "event", "dir", feat, yopt],
+            if yopt == "goodSignal":
+                binned = base.copy()
+                # Bin X into 20 buckets and plot mean success rate
+                binned["xbin"] = pd.cut(binned[feat], bins=20)
+                agg = binned.groupby(["xbin"], as_index=False).agg(good_rate=(yopt, "mean"), count=(yopt, "size"))
+                agg["xmid"] = agg["xbin"].apply(lambda r: (r.left + r.right) / 2 if pd.notnull(r) else np.nan)
+
+                line = (
+                    alt.Chart(agg.dropna())
+                    .mark_line()
+                    .encode(
+                        x=alt.X("xmid:Q", title=feat),
+                        y=alt.Y("good_rate:Q", title=f"P(good) | horizon={horizon_bars} bars"),
+                        tooltip=["xmid:Q", "good_rate:Q", "count:Q"],
+                    )
+                    .properties(height=320)
                 )
-                .properties(height=320)
-            )
-            st.altair_chart(scatter, use_container_width=True)
+                st.altair_chart(line, use_container_width=True)
+            else:
+                scatter = (
+                    alt.Chart(base)
+                    .mark_circle(size=45, opacity=0.35)
+                    .encode(
+                        x=alt.X(f"{feat}:Q", title=feat),
+                        y=alt.Y(f"{yopt}:Q", title=yopt),
+                        color=alt.Color("event:N", legend=None),
+                        tooltip=["instrument", "tf", "event", "dir", feat, yopt],
+                    )
+                    .properties(height=320)
+                )
+                st.altair_chart(scatter, use_container_width=True)
 
     with right:
-        # Quantile box plot
-        base2 = f2_view[[feat, "deltaToOppAtr"]].dropna()
-        if len(base2) >= 20:
+        # Quantile summary
+        base2 = f2_view[[feat, yopt]].dropna()
+        if len(base2) >= 20 and yopt != "goodSignal":
             base2 = base2.copy()
             base2["q"] = pd.qcut(base2[feat], 5, duplicates="drop")
             box = (
@@ -341,17 +605,35 @@ def main():
                 .mark_boxplot()
                 .encode(
                     x=alt.X("q:N", title=f"{feat} (quintiles)"),
-                    y=alt.Y("deltaToOppAtr:Q", title="Δ to opp (ATR)"),
+                    y=alt.Y(f"{yopt}:Q", title=yopt),
                 )
                 .properties(height=320)
             )
             st.altair_chart(box, use_container_width=True)
+        elif yopt == "goodSignal" and len(base2) >= 20:
+            base2 = base2.copy()
+            base2["q"] = pd.qcut(base2[feat], 5, duplicates="drop")
+            agg = base2.groupby("q", as_index=False).agg(good_rate=(yopt, "mean"), count=(yopt, "size"))
+            bar = (
+                alt.Chart(agg)
+                .mark_bar(opacity=0.8)
+                .encode(
+                    x=alt.X("q:N", title=f"{feat} (quintiles)"),
+                    y=alt.Y("good_rate:Q", title="P(good)"),
+                    tooltip=["q:N", "good_rate:Q", "count:Q"],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(bar, use_container_width=True)
         else:
-            st.info("Need at least ~20 signal rows to show quantile box plot.")
+            st.info("Need at least ~20 signal rows to show this view.")
 
     # Correlation table
     st.subheader("Feature correlations (signals only)")
-    corr_cols = [c for c in (FEATURE_COLS + DERIVED_FEATURE_COLS + ["deltaToOppAtr", "barsToOpp"]) if c in f2_view.columns]
+    extra_out_cols = ["deltaToOppAtr", "barsToOpp"]
+    if candles is not None:
+        extra_out_cols += ["mfeAtr", "maeAtr", "endAtr", "goodSignal"]
+    corr_cols = [c for c in (FEATURE_COLS + DERIVED_FEATURE_COLS + extra_out_cols) if c in f2_view.columns]
     corr_df = f2_view[corr_cols].copy()
 
     # Convert booleans to 0/1 for corr
@@ -364,7 +646,10 @@ def main():
 
     # Rule builder
     st.subheader("A+ rule builder (interactive)")
-    st.caption("This uses the proxy outcome Δ-to-next-opposite-signal (in ATR). It’s not perfect, but it’s enough to discover which filters improve expectancy.")
+    if candles is not None:
+        st.caption(f"This uses *real* forward outcomes computed from candles (horizon: {horizon_bars} bars). Use it to find filters that raise MFE and reduce MAE.")
+    else:
+        st.caption("This uses the proxy outcome Δ-to-next-opposite-signal (in ATR). It’s not perfect, but it’s enough to discover which filters improve expectancy.")
 
     controls = st.columns(4)
     min_strength = controls[0].slider("Min ewoBandRatio", 0.0, float(np.nanmax(f2_view["ewoBandRatio"].values) if "ewoBandRatio" in f2_view else 5.0), 1.0, 0.1)
@@ -384,10 +669,21 @@ def main():
 
     kpi_row(filtered)
 
-    st.write("Top signals (by Δ-to-opp ATR)")
-    cols_show = ["ts","instrument","tf","event","dir","bar","c","atr","ewo","sig","bandAbs","ewoBandRatio","signalBodyAtr","deadzoneLen","barsSinceZoneEnd","barsToOpp","deltaToOppAtr"]
+    if candles is not None and "mfeAtr" in filtered.columns:
+        st.write(f"Top signals (by MFE over next {horizon_bars} bars, ATR units)")
+        sort_col = "mfeAtr"
+        cols_show = [
+            "ts","instrument","tf","event","dir","bar","c","atr",
+            "mfeAtr","maeAtr","endAtr","goodSignal",
+            "ewo","sig","bandAbs","ewoBandRatio","signalBodyAtr","deadzoneLen",
+            "distFromEmaAtr","efficiencyLastM","maxBodyAtrLastM","firstBreakAfterDeadzone",
+        ]
+    else:
+        st.write("Top signals (by Δ-to-opp ATR) [proxy]")
+        sort_col = "deltaToOppAtr"
+        cols_show = ["ts","instrument","tf","event","dir","bar","c","atr","ewo","sig","bandAbs","ewoBandRatio","signalBodyAtr","deadzoneLen","barsSinceZoneEnd","barsToOpp","deltaToOppAtr"]
     cols_show = [c for c in cols_show if c in filtered.columns]
-    st.dataframe(filtered.sort_values("deltaToOppAtr", ascending=False).head(50)[cols_show], use_container_width=True)
+    st.dataframe(filtered.sort_values(sort_col, ascending=False).head(50)[cols_show], use_container_width=True)
 
     st.write("Table preview")
     cols_preview = ["ts","instrument","tf","event","dir","bar","o","h","l","c","ewo","sig","insideBand","bandAbs","atr"]
